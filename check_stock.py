@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""IIJmio 端末ページの在庫監視スクリプト。
+"""IIJmio 端末一覧ページの在庫監視スクリプト。
 
-Playwright でページを描画し、在庫関連キーワードの出現状況を前回実行時
-(state.json) と比較する。変化があればメールで通知する。
+https://www.iijmio.jp/device/ を Playwright で描画し、対象商品の
+カード(詳細ページへのリンクを含む区画)のテキストを取り出して、
+「一時在庫切れ」「完売しました」等の表記の有無を判定する。
+表記が消えたら「在庫復活の可能性」としてメール通知する。
 
 必要な環境変数:
   GMAIL_ADDRESS       送信元 Gmail アドレス
@@ -21,84 +23,98 @@ from email.mime.text import MIMEText
 from email.utils import formatdate
 from pathlib import Path
 
+LIST_URL = "https://www.iijmio.jp/device/"
+
+# 監視対象。key は一覧ページ内の詳細リンク (detail.html?key=...) の識別子
 TARGETS = [
     {
-        "name": "Xiaomi POCO F7 Pro",
-        "url": "https://www.iijmio.jp/device/xiaomi/pocof7pro.html",
+        "name": "POCO X8 Pro (8GB/256GB)",
+        "key": "POCO_X8_Pro_8GB_256GB",
+        "detail_url": "https://www.iijmio.jp/device/detail.html?key=POCO_X8_Pro_8GB_256GB",
     },
     {
-        "name": "Xiaomi POCO X8 Pro",
-        "url": "https://www.iijmio.jp/device/xiaomi/pocox8pro.html",
+        "name": "POCO F7 Pro (12GB/256GB)",
+        "key": "POCO_F7_Pro_12GB_256GB",
+        "detail_url": "https://www.iijmio.jp/device/detail.html?key=POCO_F7_Pro_12GB_256GB",
     },
 ]
 
-# 在庫切れを示すキーワード
+# 在庫切れを示す表記。カードのテキストにこれらが1つも無ければ「購入可能」と判定する
 OUT_MARKERS = [
     "一時在庫切れ",
-    "次回入荷未定",
+    "完売しました",
     "在庫切れ",
+    "次回入荷未定",
     "入荷未定",
     "販売を終了",
     "販売終了",
 ]
 
-# 在庫あり(購入可能)を示すキーワード
-IN_MARKERS = [
-    "このセットでお申し込み",
-    "お申し込みはこちら",
-    "カートに入れる",
-    "端末のみ購入",
-    "お申し込み",
-]
-
 STATE_FILE = Path("state.json")
+STATE_VERSION = 2  # 監視方式を変えたら上げる(旧stateを破棄して基準を取り直す)
 PAGE_TIMEOUT_MS = 60_000
 RETRY = 2
 
+STATUS_LABEL = {
+    "IN": "購入可能(在庫切れ表記なし)",
+    "OUT": "在庫切れ",
+    "NOT_FOUND": "一覧ページに見つかりません",
+}
 
-# ---------------------------------------------------------------- 解析ロジック
+# 一覧ページから key に対応するカードのテキストを取り出す JavaScript。
+# 詳細リンク(a[href*=key])を起点に親要素を6階層までさかのぼり、
+# 在庫表記を含みうる適度な大きさ(<=1200文字)の区画テキストを返す。
+JS_EXTRACT_CARD = """
+(key) => {
+  const anchors = Array.from(document.querySelectorAll('a[href*="' + key + '"]'));
+  if (anchors.length === 0) return null;
+  let best = null;
+  for (const a of anchors) {
+    let el = a;
+    let candidate = (a.innerText || "").trim();
+    for (let i = 0; i < 6 && el.parentElement; i++) {
+      el = el.parentElement;
+      const t = (el.innerText || "").trim();
+      if (t.length > 1200) break;
+      if (t.length >= 10) candidate = t;
+    }
+    if (!best || candidate.length > best.length) best = candidate;
+  }
+  return best;
+}
+"""
 
 
-def summarize(text: str) -> dict:
-    """ページ本文テキストから在庫関連の要約を作る。"""
-    out_counts = {m: text.count(m) for m in OUT_MARKERS if text.count(m) > 0}
-    in_counts = {m: text.count(m) for m in IN_MARKERS if text.count(m) > 0}
-
-    # 在庫キーワードを含む行を文脈として抜き出す(通知メール用)
-    lines = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or len(line) > 200:
-            continue
-        if any(m in line for m in OUT_MARKERS + IN_MARKERS):
-            if line not in lines:
-                lines.append(line)
-    return {"out": out_counts, "in": in_counts, "lines": lines[:30]}
+# ---------------------------------------------------------------- 判定ロジック
 
 
-def status_key(summary: dict) -> str:
-    """比較用の安定した文字列表現。"""
-    return json.dumps({"out": summary["out"], "in": summary["in"]},
-                      ensure_ascii=False, sort_keys=True)
+def judge_status(card_text: str | None) -> dict:
+    """カードのテキストから状態を判定する。"""
+    if card_text is None:
+        return {"status": "NOT_FOUND", "markers": [], "text": ""}
+    found = [m for m in OUT_MARKERS if m in card_text]
+    status = "OUT" if found else "IN"
+    return {"status": status, "markers": found, "text": card_text[:600]}
 
 
-def judge_change(prev: dict, cur: dict) -> tuple[bool, bool]:
-    """(変化があったか, 在庫復活の可能性が高いか) を返す。"""
-    changed = status_key(prev) != status_key(cur)
-    if not changed:
-        return False, False
-    prev_out = sum(prev["out"].values())
-    cur_out = sum(cur["out"].values())
-    prev_in = sum(prev["in"].values())
-    cur_in = sum(cur["in"].values())
-    restock = cur_out < prev_out or cur_in > prev_in
-    return True, restock
+def is_restock(prev: dict, cur: dict) -> bool:
+    """在庫復活(在庫切れ表記が消えて購入可能になった)か。"""
+    return prev.get("status") == "OUT" and cur.get("status") == "IN"
+
+
+def has_changed(prev: dict, cur: dict) -> bool:
+    """通知すべき変化か。表記の増減や消滅・検出不能への遷移も含む。"""
+    return (
+        prev.get("status") != cur.get("status")
+        or sorted(prev.get("markers", [])) != sorted(cur.get("markers", []))
+    )
 
 
 # ---------------------------------------------------------------- 取得
 
 
-def fetch_text(url: str) -> str:
+def fetch_cards() -> dict[str, str | None]:
+    """一覧ページを1回描画し、対象ごとのカードテキストを返す。"""
     from playwright.sync_api import sync_playwright
 
     last_err: Exception | None = None
@@ -113,19 +129,21 @@ def fetch_text(url: str) -> str:
                         "Chrome/126.0.0.0 Safari/537.36"
                     )
                 )
-                page.goto(url, timeout=PAGE_TIMEOUT_MS, wait_until="load")
-                # JS 描画の完了を待つ
-                page.wait_for_timeout(5_000)
-                text = page.inner_text("body")
+                page.goto(LIST_URL, timeout=PAGE_TIMEOUT_MS, wait_until="load")
+                page.wait_for_timeout(8_000)  # JS描画と商品一覧の読み込みを待つ
+                body_len = len(page.inner_text("body"))
+                if body_len < 500:
+                    raise RuntimeError(f"ページ本文が短すぎます ({body_len} 文字)")
+                cards: dict[str, str | None] = {}
+                for t in TARGETS:
+                    cards[t["key"]] = page.evaluate(JS_EXTRACT_CARD, t["key"])
                 browser.close()
-                if text and len(text) > 500:
-                    return text
-                raise RuntimeError(f"取得テキストが短すぎます ({len(text)} 文字)")
+                return cards
         except Exception as e:  # noqa: BLE001
             last_err = e
-            print(f"[warn] 取得失敗 ({attempt}回目): {url}: {e}", file=sys.stderr)
+            print(f"[warn] 取得失敗 ({attempt}回目): {e}", file=sys.stderr)
             time.sleep(10)
-    raise RuntimeError(f"ページ取得に失敗しました: {url}: {last_err}")
+    raise RuntimeError(f"一覧ページの取得に失敗しました: {last_err}")
 
 
 # ---------------------------------------------------------------- 通知
@@ -148,81 +166,89 @@ def send_mail(subject: str, body: str) -> None:
     print(f"[info] メール送信: {subject} -> {to}")
 
 
-def format_summary(name: str, url: str, summary: dict) -> str:
-    parts = [f"■ {name}", url]
-    parts.append(f"在庫切れ表記: {summary['out'] or 'なし'}")
-    parts.append(f"購入可能表記: {summary['in'] or 'なし'}")
-    if summary["lines"]:
-        parts.append("該当箇所の抜粋:")
-        parts.extend(f"  {line}" for line in summary["lines"])
+def format_entry(target: dict, result: dict) -> str:
+    parts = [f"■ {target['name']}"]
+    parts.append(f"状態: {STATUS_LABEL[result['status']]}")
+    if result["markers"]:
+        parts.append(f"検出した表記: {', '.join(result['markers'])}")
+    parts.append(f"詳細ページ: {target['detail_url']}")
+    parts.append(f"一覧ページ: {LIST_URL}")
+    if result["text"]:
+        parts.append("カードの抜粋:")
+        for line in result["text"].splitlines():
+            line = line.strip()
+            if line:
+                parts.append(f"  {line}")
     return "\n".join(parts)
 
 
 # ---------------------------------------------------------------- メイン
 
 
-def main() -> int:
-    prev_state: dict = {}
-    if STATE_FILE.exists():
-        prev_state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    if data.get("version") != STATE_VERSION:
+        return {}  # 旧形式は破棄して基準を取り直す
+    return data
 
-    first_run = not prev_state
-    new_state: dict = {}
-    changed_reports: list[str] = []
+
+def main() -> int:
+    prev_state = load_state()
+    prev_items: dict = prev_state.get("items", {})
+    first_run = not prev_items
+
+    try:
+        cards = fetch_cards()
+    except Exception as e:  # noqa: BLE001
+        print(f"[error] {e}", file=sys.stderr)
+        return 1  # 前回状態は維持。ジョブ失敗によりGitHubから失敗通知が届く
+
+    new_items: dict = {}
+    changed_entries: list[str] = []
     restock_names: list[str] = []
-    errors: list[str] = []
 
     for t in TARGETS:
-        name, url = t["name"], t["url"]
-        try:
-            text = fetch_text(url)
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"{name}: {e}")
-            # 取得失敗時は前回状態を維持して誤検知を防ぐ
-            if name in prev_state:
-                new_state[name] = prev_state[name]
-            continue
+        cur = judge_status(cards.get(t["key"]))
+        new_items[t["key"]] = cur
+        print(f"[info] {t['name']}: {cur['status']} markers={cur['markers']}")
 
-        cur = summarize(text)
-        new_state[name] = cur
-        print(f"[info] {name}: out={cur['out']} in={cur['in']}")
-
-        if name in prev_state:
-            changed, restock = judge_change(prev_state[name], cur)
-            if changed:
-                changed_reports.append(format_summary(name, url, cur))
-                if restock:
-                    restock_names.append(name)
+        prev = prev_items.get(t["key"])
+        if prev is not None and has_changed(prev, cur):
+            changed_entries.append(format_entry(t, cur))
+            if is_restock(prev, cur):
+                restock_names.append(t["name"])
 
     STATE_FILE.write_text(
-        json.dumps(new_state, ensure_ascii=False, indent=2, sort_keys=True),
+        json.dumps(
+            {"version": STATE_VERSION, "items": new_items},
+            ensure_ascii=False, indent=2, sort_keys=True,
+        ),
         encoding="utf-8",
     )
 
     if first_run:
-        body = "在庫監視の初回実行が完了しました。現在の状態を基準として保存します。\n\n"
-        body += "\n\n".join(
-            format_summary(t["name"], t["url"], new_state[t["name"]])
-            for t in TARGETS if t["name"] in new_state
+        body = (
+            "在庫監視(一覧ページ方式)の初回実行が完了しました。"
+            "現在の状態を基準として保存します。\n\n"
         )
-        if errors:
-            body += "\n\n取得エラー:\n" + "\n".join(errors)
-        send_mail("[IIJmio在庫監視] セットアップ完了 (初回実行)", body)
-    elif changed_reports:
+        body += "\n\n".join(
+            format_entry(t, new_items[t["key"]]) for t in TARGETS
+        )
+        send_mail("[IIJmio在庫監視] セットアップ完了 (一覧ページ方式)", body)
+    elif changed_entries:
         if restock_names:
             subject = f"[IIJmio在庫監視] 在庫復活の可能性: {', '.join(restock_names)}"
         else:
             subject = "[IIJmio在庫監視] 在庫表記に変化がありました"
-        body = "\n\n".join(changed_reports)
-        if errors:
-            body += "\n\n取得エラー:\n" + "\n".join(errors)
-        send_mail(subject, body)
+        send_mail(subject, "\n\n".join(changed_entries))
     else:
         print("[info] 変化なし")
 
-    if errors:
-        print("[error] " + " / ".join(errors), file=sys.stderr)
-        return 1
     return 0
 
 
